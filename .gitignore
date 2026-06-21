@@ -216,3 +216,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# АвтоСнаб local secrets and uploaded invoice files
+service-account.json
+**/service-account.json
+backend/secrets/*.json
+backend/uploads/invoices/*
+!backend/uploads/invoices/.gitkeep
+.env.local
