@@ -268,21 +268,6 @@ POST /api/v1/invoice-review/{review_id}/sync-sheet-and-confirm-send
 backend формирует payload и отправляет данные в iiko adapter
 ```
 
-### Новые файлы
-
-```text
-backend/app/services/ocr_service.py
-backend/app/services/google_sheets_service.py
-```
-
-### Новые endpoint'ы
-
-```text
-POST /api/v1/invoice-review/upload-photo
-POST /api/v1/invoice-review/{review_id}/google-sheet
-POST /api/v1/invoice-review/{review_id}/sync-sheet-and-confirm-send
-```
-
 ### Настройки Google API
 
 Для реального OCR и создания Google Таблицы нужно создать service account в Google Cloud, выдать ему доступ к Google Vision API, Google Sheets API и Google Drive API, скачать JSON credentials и указать путь к файлу.
