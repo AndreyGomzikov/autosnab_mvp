@@ -41,6 +41,15 @@ class InvoiceReviewCreateRequest(BaseModel):
     due_date: str | None = None
     venue: str | None = None
     delivery_address: str | None = None
+    display_store: str | None = None
+    document_form: str | None = None
+    supplier_inn: str | None = None
+    consignee: str | None = None
+    recipient: str | None = None
+    trade_point: str | None = None
+    warehouse: str | None = None
+    basis: str | None = None
+    total_sum: float | None = None
     iiko_default_store_id: str | None = None
     iiko_organization: str | None = None
     iiko_organization_id: str | None = None
@@ -61,6 +70,15 @@ class InvoiceReviewUpdateRequest(BaseModel):
     due_date: str | None = None
     venue: str | None = None
     delivery_address: str | None = None
+    display_store: str | None = None
+    document_form: str | None = None
+    supplier_inn: str | None = None
+    consignee: str | None = None
+    recipient: str | None = None
+    trade_point: str | None = None
+    warehouse: str | None = None
+    basis: str | None = None
+    total_sum: float | None = None
     iiko_default_store_id: str | None = None
     iiko_organization: str | None = None
     iiko_organization_id: str | None = None
@@ -111,6 +129,15 @@ class SyncSheetAndConfirmRequest(ConfirmSendToIikoRequest):
     due_date: str | None = None
     venue: str | None = None
     delivery_address: str | None = None
+    display_store: str | None = None
+    document_form: str | None = None
+    supplier_inn: str | None = None
+    consignee: str | None = None
+    recipient: str | None = None
+    trade_point: str | None = None
+    warehouse: str | None = None
+    basis: str | None = None
+    total_sum: float | None = None
     iiko_default_store_id: str | None = None
     iiko_organization: str | None = None
     iiko_organization_id: str | None = None
@@ -129,5 +156,4 @@ class InvoiceReviewResponse(BaseModel):
     ocr: dict | None = None
     parser_provider: str | None = None
     parser_notes: list[str] = Field(default_factory=list)
-    ai_agent_error: str | None = None
     next_actions: dict

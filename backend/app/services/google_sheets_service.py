@@ -2,215 +2,230 @@ import json
 from typing import Any
 
 from app.config import settings
+from app.services.google_oauth_service import get_google_user_credentials
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/script.projects",
 ]
+
+
+INVOICE_REGISTER_COLUMN_WIDTHS = {
+    0: 190,   # Время загрузки документа
+    2: 210,   # Индикатор дубля документа
+    13: 280,  # Наименование товара из документа
+    14: 180,  # Госсистемы
+    15: 240,  # Наименование товара в УС
+    16: 220,  # Товар найден в справочнике
+    18: 190,  # Кол-во из документа
+    20: 180,  # Стоимость без НДС
+    32: 200,  # Последняя дата поставки
+    34: 230,  # Отклонение от цены прайса
+    37: 250,  # Причина ручной корректировки
+}
 
 
 class GoogleSheetsConfigurationError(RuntimeError):
     pass
 
 
-def create_invoice_review_spreadsheet(receiving, sheet_data: dict, apps_script_text: str) -> dict[str, Any]:
-    """Create a real Google Spreadsheet and attach the MVP-4 Apps Script menu.
+def create_invoice_review_spreadsheet(
+    receiving,
+    sheet_data: dict,
+    apps_script_text: str | None = None,
+    public_api_base_url: str | None = None,
+) -> dict[str, Any]:
+    """Create a real Google Spreadsheet for invoice review.
 
-    Requires GOOGLE_SHEETS_ENABLED=true and service account credentials.
-    If GOOGLE_APPS_SCRIPT_ENABLED=true, the service automatically creates a
-    container-bound Apps Script project for the spreadsheet and writes Code.gs.
-    The Apps Script source is also kept on a backup sheet so the user can copy
-    it manually if the Apps Script API is unavailable in a client's Google Cloud
-    project.
+    The user-facing spreadsheet contains one editable invoice-register sheet:
+    - Накладные
+
+    The table follows the header layout from «АвтоСнаб_Шапка.xlsx».
     """
     if not settings.google_sheets_enabled:
         raise GoogleSheetsConfigurationError(
-            "Google Sheets API отключен. Укажите GOOGLE_SHEETS_ENABLED=true и credentials service account."
-        )
-    credentials_path = _credentials_path()
-    if credentials_path is None:
-        raise GoogleSheetsConfigurationError(
-            "Не указан GOOGLE_APPLICATION_CREDENTIALS или GOOGLE_SERVICE_ACCOUNT_FILE для Google Sheets API."
+            "Google Sheets API отключен. Укажите GOOGLE_SHEETS_ENABLED=true и credentials OAuth user."
         )
     try:
-        from google.oauth2 import service_account
         from googleapiclient.discovery import build
     except ImportError as exc:
         raise GoogleSheetsConfigurationError(
-            "Не установлены зависимости google-api-python-client/google-auth. Выполните pip install -r requirements.txt."
+            "Не установлены зависимости google-api-python-client/google-auth/google-auth-oauthlib. Выполните pip install -r requirements.txt."
         ) from exc
 
-    credentials = service_account.Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
+    credentials = get_google_user_credentials()
     sheets_service = build("sheets", "v4", credentials=credentials)
     drive_service = build("drive", "v3", credentials=credentials)
 
+    primary_sheet_name = sheet_data.get("primary_sheet_name") or next(iter(sheet_data["sheets"]))
     spreadsheet_body = {
         "properties": {"title": sheet_data["spreadsheet_name"]},
         "sheets": [
-            {"properties": {"title": "Проверка накладной"}},
-            {"properties": {"title": "Товарные позиции"}},
-            {"properties": {"title": "Отправка в iiko"}},
-            {"properties": {"title": "Apps Script backup"}},
+            {"properties": {"title": primary_sheet_name}},
         ],
     }
     spreadsheet = sheets_service.spreadsheets().create(body=spreadsheet_body, fields="spreadsheetId,spreadsheetUrl").execute()
     spreadsheet_id = spreadsheet["spreadsheetId"]
     spreadsheet_url = spreadsheet["spreadsheetUrl"]
 
-    appsscript_install_result = _install_bound_apps_script(
-        credentials=credentials,
-        spreadsheet_id=spreadsheet_id,
-        title=f"АвтоСнаб MVP-4 menu {receiving.id}",
-        apps_script_text=apps_script_text,
-    )
+    summary_values = sheet_data["sheets"][primary_sheet_name]
+
+    button_result = {
+        "installed": False,
+        "status": "button_removed",
+        "send_page_url": None,
+        "message": "Кнопка-ссылка 'Отправить в iiko' на листе 'Накладные' не создаётся.",
+    }
 
     values = [
-        {"range": "Проверка накладной!A1:D50", "values": sheet_data["sheets"]["Проверка накладной"]},
-        {"range": "Товарные позиции!A1:K500", "values": sheet_data["sheets"]["Товарные позиции"]},
-        {
-            "range": "Отправка в iiko!A1:B40",
-            "values": _send_sheet_values(receiving, sheet_data, appsscript_install_result),
-        },
-        {
-            "range": "Apps Script backup!A1:A250",
-            "values": [[line] for line in apps_script_text.splitlines()],
-        },
+        {"range": f"{primary_sheet_name}!A1:AL500", "values": summary_values},
     ]
     sheets_service.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
-        body={"valueInputOption": "USER_ENTERED", "data": values},
+        body={"valueInputOption": "RAW", "data": values},
     ).execute()
-    _format_spreadsheet(sheets_service, spreadsheet_id, hide_backup_sheet=appsscript_install_result.get("installed", False))
+    _format_spreadsheet(sheets_service, spreadsheet_id)
 
     if settings.google_drive_folder_id:
         drive_service.files().update(
             fileId=spreadsheet_id,
             addParents=settings.google_drive_folder_id,
             fields="id, parents",
+            supportsAllDrives=True,
         ).execute()
 
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "spreadsheet_name": sheet_data["spreadsheet_name"],
-        "apps_script": appsscript_install_result,
+        "send_button": button_result,
     }
 
 
-def _install_bound_apps_script(credentials, spreadsheet_id: str, title: str, apps_script_text: str) -> dict[str, Any]:
-    if not settings.google_apps_script_enabled:
-        return {
-            "installed": False,
-            "status": "disabled",
-            "message": "GOOGLE_APPS_SCRIPT_ENABLED=false. Код сохранен на листе 'Apps Script backup'.",
-        }
-    try:
-        from googleapiclient.discovery import build
-    except ImportError as exc:
-        return {"installed": False, "status": "dependency_error", "message": str(exc)}
-
-    try:
-        script_service = build("script", "v1", credentials=credentials)
-        project = script_service.projects().create(
-            body={"title": title, "parentId": spreadsheet_id}
-        ).execute()
-        script_id = project["scriptId"]
-        manifest = {
-            "timeZone": "Europe/Moscow",
-            "exceptionLogging": "STACKDRIVER",
-            "oauthScopes": [
-                "https://www.googleapis.com/auth/spreadsheets.currentonly",
-                "https://www.googleapis.com/auth/script.external_request",
-                "https://www.googleapis.com/auth/userinfo.email",
-            ],
-        }
-        script_service.projects().updateContent(
-            scriptId=script_id,
-            body={
-                "files": [
-                    {
-                        "name": "appsscript",
-                        "type": "JSON",
-                        "source": json.dumps(manifest, ensure_ascii=False, indent=2),
-                    },
-                    {"name": "Code", "type": "SERVER_JS", "source": apps_script_text},
-                ]
-            },
-        ).execute()
-        return {
-            "installed": True,
-            "status": "installed",
-            "script_id": script_id,
-            "script_url": f"https://script.google.com/d/{script_id}/edit",
-            "message": "Apps Script автоматически привязан к Google Таблице. После открытия таблицы появится меню 'АвтоСнаб'.",
-        }
-    except Exception as exc:  # noqa: BLE001 - Google API errors must not block sheet creation
-        return {
-            "installed": False,
-            "status": "install_error",
-            "message": str(exc),
-            "fallback": "Код сохранен на листе 'Apps Script backup'. Проверьте, что Google Apps Script API включен в Google Cloud.",
-        }
 
 
-def _send_sheet_values(receiving, sheet_data: dict, apps_script_result: dict[str, Any] | None = None) -> list[list[Any]]:
-    apps_script_result = apps_script_result or {}
-    script_status = apps_script_result.get("status") or "unknown"
-    script_message = apps_script_result.get("message") or ""
-    script_url = apps_script_result.get("script_url") or ""
-    return [
-        ["Поле", "Значение"],
-        ["ID проверки", receiving.id],
-        ["Статус", sheet_data["status"]],
-        ["Что сделать", "Проверьте бизнес-поля на листах 'Проверка накладной' и 'Товарные позиции'. После проверки используйте меню АвтоСнаб → Предпросмотр отправки, затем АвтоСнаб → Отправить в iiko."],
-        ["Endpoint предпросмотра", f"/api/v1/invoice-review/{receiving.id}/preview"],
-        ["Endpoint отправки", f"/api/v1/invoice-review/{receiving.id}/sync-sheet-and-confirm-send"],
-        ["Важно", "Перед отправкой пользователь должен видеть поставщика, точку доставки, товары, количества, цены, суммы, НДС и статус. iiko ID остаются служебными в backend."],
-        ["Apps Script статус", script_status],
-        ["Apps Script сообщение", script_message],
-        ["Apps Script URL", script_url],
-        ["Последний статус отправки", ""],
-        ["Время последней отправки", ""],
-    ]
-
-
-def _format_spreadsheet(sheets_service, spreadsheet_id: str, hide_backup_sheet: bool = False) -> None:
+def _format_spreadsheet(sheets_service, spreadsheet_id: str) -> None:
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     sheet_ids = {sheet["properties"]["title"]: sheet["properties"]["sheetId"] for sheet in spreadsheet["sheets"]}
     requests = []
     for title, sheet_id in sheet_ids.items():
-        requests.append(
-            {
-                "repeatCell": {
-                    "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
-                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                    "fields": "userEnteredFormat.textFormat.bold",
-                }
-            }
-        )
-        requests.append(
-            {
-                "autoResizeDimensions": {
-                    "dimensions": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 14}
-                }
-            }
-        )
-    if hide_backup_sheet and "Apps Script backup" in sheet_ids:
+        header_end_column_index = 38 if title == "Накладные" else (7 if title == "Накладная" else 10)
         requests.append(
             {
                 "updateSheetProperties": {
-                    "properties": {"sheetId": sheet_ids["Apps Script backup"], "hidden": True},
-                    "fields": "hidden",
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            }
+        )
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": header_end_column_index,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": 53 / 255,
+                                "green": 104 / 255,
+                                "blue": 84 / 255,
+                            },
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP",
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                            },
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)",
+                }
+            }
+        )
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 500,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": header_end_column_index,
+                    },
+                    "cell": {"userEnteredFormat": {"wrapStrategy": "CLIP", "verticalAlignment": "MIDDLE"}},
+                    "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)",
+                }
+            }
+        )
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": header_end_column_index,
+                    },
+                    "properties": {"pixelSize": 145},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+        if title == "Накладные":
+            for column_index, pixel_size in INVOICE_REGISTER_COLUMN_WIDTHS.items():
+                requests.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "startIndex": column_index,
+                                "endIndex": column_index + 1,
+                            },
+                            "properties": {"pixelSize": pixel_size},
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+        requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": 0,
+                        "endIndex": 1,
+                    },
+                    "properties": {"pixelSize": 36},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+        requests.append(
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": header_end_column_index,
+                        }
+                    }
                 }
             }
         )
     if requests:
         sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
-
-
-def _credentials_path() -> str | None:
-    return settings.google_application_credentials or settings.google_service_account_file
 
 
 def serialize_sheet_result(result: dict[str, Any]) -> str:

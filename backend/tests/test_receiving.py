@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -337,11 +338,11 @@ def test_mvp4_invoice_review_sheet_preview_and_send():
     sheet = client.get(f"/api/v1/invoice-review/{review_id}/sheet")
     assert sheet.status_code == 200
     assert sheet.json()["action"]["button_label"] == "Подтвердить и отправить в iiko"
-    assert "Товарные позиции" in sheet.json()["sheets"]
+    assert "Накладные" in sheet.json()["sheets"]
 
     csv_response = client.get(f"/api/v1/invoice-review/{review_id}/sheet.csv")
     assert csv_response.status_code == 200
-    assert "Проверка накладной" in csv_response.text
+    assert "Накладная" in csv_response.text
 
     preview = client.get(f"/api/v1/invoice-review/{review_id}/preview?target_organization=Добрая%20столовая&target_warehouse=Основной%20склад")
     assert preview.status_code == 200
@@ -384,14 +385,17 @@ def test_mvp4_requires_manual_approval_before_send():
     assert "подтвердить" in send.json()["detail"]
 
 
-def test_mvp4_real_ocr_endpoint_requires_google_vision_credentials():
+def test_mvp4_real_ocr_endpoint_falls_back_to_manual_review_without_ocr_credentials():
     response = client.post(
         "/api/v1/invoice-review/upload-photo",
         files={"file": ("invoice.jpg", b"fake image bytes", "image/jpeg")},
         data={"venue": "Добрая столовая", "create_google_sheet": "false"},
     )
-    assert response.status_code == 503
-    assert "Google Vision OCR" in response.json()["detail"]
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ocr"]["provider"] == "manual_review_fallback"
+    assert data["ocr"]["error"]
+    assert data["next_actions"]["open_csv"]
 
 
 def test_mvp4_sync_sheet_corrections_before_iiko_send():
@@ -435,8 +439,8 @@ def test_mvp4_sync_sheet_corrections_before_iiko_send():
     assert data["payload"]["preview"]["items"][0]["quantity"] == 2
 
 
-def test_mvp4_ai_agent_disabled_falls_back_to_deterministic_parser():
-    from app.services.ai_invoice_agent_service import extract_invoice_payload_with_fallback
+def test_mvp4_deterministic_parser_parses_ocr_text():
+    from app.services.invoice_parser_service import extract_invoice_payload_with_fallback
 
     raw_text = """
     ООО Питер Кельн
@@ -444,15 +448,15 @@ def test_mvp4_ai_agent_disabled_falls_back_to_deterministic_parser():
     Молоко кокосовое Aroy-D 400 мл 5 шт 250 1250
     """
     payload = extract_invoice_payload_with_fallback(raw_text, "invoice.jpg")
-    assert payload["parser_provider"] == "deterministic_fallback"
+    assert payload["parser_provider"] == "deterministic_parser"
     assert payload["supplier"] == "ООО Питер Кельн"
     assert payload["invoice_number"] == "12345"
     assert payload["invoice_date"] == "2026-06-19"
     assert payload["items"][0]["name"] == "Молоко кокосовое Aroy-D 400 мл"
 
 
-def test_mvp4_ai_agent_upload_photo_response_can_include_parser_metadata(monkeypatch):
-    from app.services import ai_invoice_agent_service, ocr_service
+def test_mvp4_upload_photo_response_can_include_parser_metadata(monkeypatch):
+    from app.services import invoice_parser_service, ocr_service
     from app.routers import invoice_review as invoice_review_router
 
     def fake_ocr(_file_path):
@@ -463,9 +467,9 @@ def test_mvp4_ai_agent_upload_photo_response_can_include_parser_metadata(monkeyp
             "confidence": None,
         }
 
-    def fake_ai(raw_text, fallback_filename=None):
+    def fake_parser(raw_text, fallback_filename=None):
         return {
-            "parser_provider": "ai_agent",
+            "parser_provider": "deterministic_parser",
             "supplier": "ООО Питер Кельн",
             "supplier_legal_name": "ООО Питер Кельн",
             "invoice_number": "555",
@@ -481,17 +485,17 @@ def test_mvp4_ai_agent_upload_photo_response_can_include_parser_metadata(monkeyp
                     "price": 100,
                     "sum": 200,
                     "vat": None,
-                    "comment": "AI Agent parsed",
+                    "comment": "Parser test",
                     "confidence": 0.91,
                 }
             ],
-            "parser_notes": ["AI Agent test"],
+            "parser_notes": ["Parser test"],
         }
 
     monkeypatch.setattr(ocr_service, "recognize_invoice_image", fake_ocr)
     monkeypatch.setattr(invoice_review_router, "recognize_invoice_image", fake_ocr)
-    monkeypatch.setattr(ai_invoice_agent_service, "extract_invoice_payload_with_fallback", fake_ai)
-    monkeypatch.setattr(invoice_review_router, "extract_invoice_payload_with_fallback", fake_ai)
+    monkeypatch.setattr(invoice_parser_service, "extract_invoice_payload_with_fallback", fake_parser)
+    monkeypatch.setattr(invoice_review_router, "extract_invoice_payload_with_fallback", fake_parser)
 
     response = client.post(
         "/api/v1/invoice-review/upload-photo",
@@ -500,10 +504,52 @@ def test_mvp4_ai_agent_upload_photo_response_can_include_parser_metadata(monkeyp
     )
     assert response.status_code == 200
     data = response.json()
-    assert data["parser_provider"] == "ai_agent"
+    assert data["parser_provider"] == "deterministic_parser"
     assert data["ocr"]["provider"] == "fake_google_vision"
-    assert data["parser_notes"] == ["AI Agent test"]
+    assert data["parser_notes"] == ["Parser test"]
 
+
+
+def test_invoice_review_sheet_does_not_guess_supplier_inn_from_raw_text():
+    response = client.post(
+        "/api/v1/invoice-review/upload",
+        json={
+            "raw_text": """
+            Страница 2
+            Товарная накладная имеет приложение на
+            Всего отпущено на сумму
+            ООО "ЛИР", ИНН 3906400288
+            """,
+            "document_form": "ТОРГ-12",
+            "total_sum": 16351.45,
+            "items": [
+                {
+                    "name": "Окорок \"По-тамбовски\" к/в в/у",
+                    "quantity": 4.058,
+                    "unit": "кг",
+                    "price": 702.0,
+                    "sum": 2848.72,
+                    "vat": "7%",
+                    "vat_percent": 7.0,
+                    "vat_sum": 199.41,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    review_id = response.json()["review_id"]
+    sheet = client.get(f"/api/v1/invoice-review/{review_id}/sheet")
+
+    assert sheet.status_code == 200
+    rows = sheet.json()["sheets"]["Накладные"]
+    assert rows[1][5] == ""
+    assert rows[1][6] == ""
+    assert rows[1][7] == ""
+    assert rows[1][13] == "Окорок \"По-тамбовски\" к/в в/у"
+    assert rows[1][17] == "кг"
+    assert rows[1][21] == "7%"
+    assert rows[1][24] == 16351.45
 
 def test_mvp4_auto_fills_iiko_fields_from_references(monkeypatch):
     from app.services import iiko_reference_mapping_service
@@ -528,20 +574,63 @@ def test_mvp4_auto_fills_iiko_fields_from_references(monkeypatch):
             "supplier": "Питер Кельн",
             "invoice_date": "2026-06-19",
             "invoice_number": "780",
+            "document_form": "ТОРГ-12",
             "venue": "Добрая столовая",
-            "items": [{"name": "Сахар ванильный", "quantity": 2, "unit": "шт", "price": 110}],
+            "items": [
+                {"name": "Сахар ванильный", "quantity": 2, "unit": "шт", "price": 110},
+                {"name": "Молоко", "quantity": 1, "unit": "л", "price": 90},
+            ],
         },
     )
     assert response.status_code == 200
     review_id = response.json()["review_id"]
     sheet = client.get(f"/api/v1/invoice-review/{review_id}/sheet")
     assert sheet.status_code == 200
-    summary = sheet.json()["sheets"]["Проверка накладной"]
-    items = sheet.json()["sheets"]["Товарные позиции"]
+    rows = sheet.json()["sheets"]["Накладные"]
     assert "Служебные поля iiko" not in sheet.json()["sheets"]
-    assert any(row[0] == "Поставщик" and row[1] == "Питер Кельн" for row in summary)
-    assert items[1][1] == "Готово"
-    assert items[1][3] == "Сахар ванильный"
+    assert rows[0][0] == "Время загрузки документа"
+    assert rows[0][1] == "ID документа"
+    assert rows[0][2] == "Индикатор дубля документа"
+    assert rows[0][6] == "Поставщик"
+    assert rows[0][13] == "Наименование товара из документа"
+    assert rows[0][14] == "Госсистемы"
+    assert "ЕГАИС" not in rows[0]
+    assert "Меркурий" not in rows[0]
+    assert "Честный знак" not in rows[0]
+    assert rows[0][18] == "Кол-во из документа"
+    assert rows[0][28] == "Дата приема"
+    assert rows[0][36] == "Статус строки"
+    assert rows[1][0] != ""
+    assert rows[1][1] == 1
+    assert rows[1][3] == "ТОРГ-12"
+    assert rows[1][5] == "780"
+    assert rows[1][4] == "2026-06-19"
+    assert rows[1][6] == "Питер Кельн"
+    assert rows[1][10] == "Добрая столовая"
+    assert rows[2][0] == ""
+    assert rows[2][1] == ""
+    assert rows[2][3] == ""
+    assert rows[2][4] == ""
+    assert rows[2][5] == ""
+    assert rows[2][6] == ""
+    assert rows[2][7] == ""
+    assert rows[2][8] == ""
+    assert rows[2][9] == ""
+    assert rows[2][10] == ""
+    assert rows[2][11] == ""
+    assert rows[2][12] == ""
+    assert rows[1][24] != ""
+    assert rows[2][24] == ""
+    assert "Статус проверки" not in rows[0]
+    assert "Что исправить" not in rows[0]
+    assert rows[1][13] == "Сахар ванильный"
+    assert rows[1][15] == ""
+    assert rows[1][26] == ""
+    assert rows[1][27] == ""
+    assert rows[1][34] == ""
+    assert rows[1][35] == ""
+    assert rows[1][36] == ""
+    assert rows[1][37] == ""
 
     preview = client.get(f"/api/v1/invoice-review/{review_id}/preview")
     assert preview.status_code == 200
@@ -550,3 +639,103 @@ def test_mvp4_auto_fills_iiko_fields_from_references(monkeypatch):
     assert data["items"][0]["iikoProductId"] == "PROD-001"
     assert data["items"][0]["productArticle"] == "SUGAR-001"
     assert data["items"][0]["mappingStatus"] == "ready"
+
+
+
+def test_invoice_review_sheet_clears_non_visible_values_on_torg12_continuation_page():
+    response = client.post(
+        "/api/v1/invoice-review/upload",
+        json={
+            "raw_text": """
+            Страница 2
+            Товарная накладная имеет приложение на
+            Всего отпущено на сумму
+            Окорок "По-тамбовски" к/в в/у
+            166 кг
+            4,058
+            702,00
+            2 848,72
+            7%
+            199,41
+            3 048,13
+            16 351,45
+            ООО "ЛИР", ИНН 3906400288
+            """,
+            "document_form": "ТОРГ-12",
+            "total_sum": 16351.45,
+            "items": [
+                {
+                    "name": "Окорок \"По-тамбовски\" к/в в/у",
+                    "quantity": 4.058,
+                    "unit": "кг",
+                    "price": 702.0,
+                    "sum": 2848.72,
+                    "vat": "7%",
+                    "vat_percent": 7.0,
+                    "vat_sum": 199.41,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    review_id = response.json()["review_id"]
+
+    db = TestingSessionLocal()
+    try:
+        receiving = db.query(Receiving).filter(Receiving.id == review_id).one()
+        receiving.supplier = "41"
+        receiving.venue = "41"
+        document = receiving.documents[-1]
+        document.invoice_number = "41"
+        document.invoice_date = "41"
+        meta = json.loads(document.recognized_items_json)
+        meta["header"].update(
+            {
+                "document_number": "41",
+                "supplier_inn": "3906400288",
+                "consignee": "41",
+                "recipient": "41",
+                "trade_point": "41",
+                "warehouse": "41",
+                "basis": "41",
+                "duplicate_indicator": "41",
+            }
+        )
+        meta["items"][0].update(
+            {
+                "egais": "41",
+                "mercury": "41",
+                "honest_sign": "41",
+                "iiko_product_id": "41",
+                "product_article": "41",
+                "amount_unit": "41",
+                "acceptance_date": "41",
+                "accepted_by": "41",
+                "last_delivery_date": "41",
+                "last_price": "41",
+            }
+        )
+        document.recognized_items_json = json.dumps(meta, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+
+    sheet = client.get(f"/api/v1/invoice-review/{review_id}/sheet")
+    assert sheet.status_code == 200
+    rows = sheet.json()["sheets"]["Накладные"]
+    data_row = rows[1]
+
+    # На странице-продолжении шапки документа нет, поэтому эти поля не заполняем.
+    for column_index in [2, 4, 5, 6, 7, 8, 9, 10, 11, 12]:
+        assert data_row[column_index] == ""
+
+    # Пользовательские/ручные/УС-поля не должны заполняться техническими значениями.
+    for column_index in [14, 15, 16, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]:
+        assert data_row[column_index] == ""
+
+    assert data_row[3] == "ТОРГ-12"
+    assert data_row[13] == "Окорок \"По-тамбовски\" к/в в/у"
+    assert data_row[17] == "кг"
+    assert data_row[21] == "7%"
+    assert data_row[24] == 16351.45
