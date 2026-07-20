@@ -239,3 +239,8 @@ backend/uploads/invoices/*
 /.idea/vcs.xml
 /.idea/inspectionProfiles/profiles_settings.xml
 /.idea/modules.xml
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
