@@ -1,0 +1,21 @@
+fastapi==0.115.6
+uvicorn==0.34.3
+sqlalchemy==2.0.36
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20
+pytest==8.3.4
+httpx==0.28.1
+openai>=2.26.0,<3
+pypdf>=5.1.0,<7
+pillow>=11.0.0,<13
+
+google-api-python-client==2.154.0
+google-auth==2.37.0
+google-auth-oauthlib==1.2.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.1+cpu
+torchvision==0.27.1+cpu
+mineru[pipeline]==3.4.2
+six==1.17.0

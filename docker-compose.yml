@@ -1,0 +1,95 @@
+services:
+  backend:
+    build: .
+    container_name: autosnab_backend_mvp4
+    restart: unless-stopped
+    # Optional cap for small/shared VPS deploys (e.g. a box that also runs
+    # other services) so a memory spike here cannot OOM-kill anything else
+    # on the host. Leave BACKEND_MEM_LIMIT unset on a dedicated machine.
+    mem_limit: ${BACKEND_MEM_LIMIT:-0}
+    ports:
+      - "8000:8000"
+    env_file:
+      - ${BACKEND_ENV_FILE:-.env}
+    environment:
+      SECRETS_ENV_FILE: /app/.env
+      DATABASE_URL: sqlite:////data/autosnab_mvp.db
+      UPLOADED_INVOICES_DIR: /app/uploads/invoices
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-http://localhost:8000}
+    volumes:
+      - ${BACKEND_ENV_FILE:-./.env}:/app/.env
+      - autosnab_data:/data
+      - autosnab_uploads:/app/uploads
+      - autosnab_exports:/app/exports
+      - autosnab_hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/runtime', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: autosnab_backend_ngrok
+    restart: unless-stopped
+    profiles:
+      - public-tunnel
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    command:
+      - http
+      - http://backend:8000
+    ports:
+      - "4040:4040"
+
+  # For a VPS deploy with a stable public HTTPS address but no purchased
+  # domain: set PUBLIC_DOMAIN to a nip.io hostname that resolves to the
+  # server's own public IP (e.g. 203-0-113-5.nip.io for 203.0.113.5), and
+  # Caddy will obtain a real, browser-trusted Let's Encrypt certificate for
+  # it automatically. Requires inbound ports 80/443 open on the VPS.
+  caddy:
+    image: caddy:2-alpine
+    container_name: autosnab_backend_caddy
+    restart: unless-stopped
+    profiles:
+      - public-ip
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # A plain default (not a required `:?` var) on purpose: compose
+      # interpolates every service's env block up front regardless of which
+      # profile is active, so a required var here would break `docker
+      # compose up` even when only the default/public-tunnel profile runs.
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-set-PUBLIC_DOMAIN-in-.env.invalid}
+    ports:
+      - "80:80"
+      # Port 80 must stay mapped as-is: Let's Encrypt's HTTP-01 challenge
+      # always validates against the well-known port 80, regardless of what
+      # port the certificate ends up serving traffic on. If the host's 443
+      # is already taken by another service, override CADDY_HTTPS_HOST_PORT
+      # (e.g. 8443) - Caddy inside the container still just serves its
+      # normal 443, only the host-side mapping changes.
+      - "${CADDY_HTTPS_HOST_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - autosnab_caddy_data:/data
+      - autosnab_caddy_config:/config
+
+volumes:
+  autosnab_data:
+  autosnab_uploads:
+  autosnab_exports:
+  autosnab_hf_cache:
+  autosnab_caddy_data:
+  autosnab_caddy_config:
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1376
